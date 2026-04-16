@@ -9,6 +9,7 @@ Output: PDF → --outdir (default ./output), Markdown → Obsidian Journal.
 import argparse
 import json
 import re
+import ssl
 import subprocess
 import sys
 import urllib.request
@@ -51,6 +52,30 @@ def pdf_text(path: Path) -> str:
 def sanitise_path(raw: str) -> Path:
     """Strip shell backslash-escapes left inside double-quoted arguments."""
     return Path(raw.replace('\\ ', ' ').replace('\\', ''))
+
+
+# ── SSL context (macOS Python ships without CA bundle linked) ─────────────────
+
+def make_ssl_context() -> ssl.SSLContext:
+    """Return a verified SSL context, trying certifi then /etc/ssl/cert.pem (macOS)."""
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        return ctx
+    except ImportError:
+        pass
+    # macOS ships a CA bundle at /etc/ssl/cert.pem
+    import os
+    mac_bundle = '/etc/ssl/cert.pem'
+    if os.path.exists(mac_bundle):
+        ctx = ssl.create_default_context(cafile=mac_bundle)
+        return ctx
+    # Last resort: unverified (warns the user)
+    print('Warning: no CA bundle found; proceeding with unverified TLS.', file=sys.stderr)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 # ── OAuth authentication ───────────────────────────────────────────────────────
@@ -269,7 +294,7 @@ def appraise_with_gpt(study_text: str, pdf_name: str, model: str) -> str:
 
     print(f'Sending to {model}…', flush=True)
     try:
-        with urllib.request.urlopen(req, timeout=240) as resp:
+        with urllib.request.urlopen(req, timeout=240, context=make_ssl_context()) as resp:
             data = json.loads(resp.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8', errors='replace')
