@@ -276,14 +276,18 @@ def appraise_with_gpt(study_text: str, pdf_name: str, model: str) -> str:
         study_text=study_text[:72000]
     )
 
+    # Use Chat Completions API — the OAuth token issued by the Codex CLI has the
+    # api.chat.completions.write scope, not api.responses.write (Responses API).
     payload = {
         'model': model,
-        'instructions': SYSTEM_PROMPT,
-        'input': prompt,
+        'messages': [
+            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'user',   'content': prompt},
+        ],
     }
 
     req = urllib.request.Request(
-        'https://api.openai.com/v1/responses',
+        'https://api.openai.com/v1/chat/completions',
         data=json.dumps(payload).encode('utf-8'),
         headers={
             'Authorization': f'Bearer {token}',
@@ -294,14 +298,14 @@ def appraise_with_gpt(study_text: str, pdf_name: str, model: str) -> str:
 
     print(f'Sending to {model}…', flush=True)
     try:
-        with urllib.request.urlopen(req, timeout=240, context=make_ssl_context()) as resp:
+        with urllib.request.urlopen(req, timeout=300, context=make_ssl_context()) as resp:
             data = json.loads(resp.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8', errors='replace')
         print(
             f'Error: OpenAI API returned HTTP {e.code}.\n'
             f'Response: {body}\n'
-            'Check that your OAuth token is valid and not expired.',
+            'Your OAuth token may be expired. Re-login with: codex auth login',
             file=sys.stderr
         )
         sys.exit(1)
@@ -309,15 +313,8 @@ def appraise_with_gpt(study_text: str, pdf_name: str, model: str) -> str:
         print(f'Error: Network error calling OpenAI API: {e.reason}', file=sys.stderr)
         sys.exit(1)
 
-    # Parse response — support both output_text shorthand and output[].content[] format
-    if data.get('output_text'):
-        return data['output_text']
-    texts = []
-    for item in data.get('output', []):
-        for content in item.get('content', []):
-            if content.get('type') in ('output_text', 'text'):
-                texts.append(content.get('text', ''))
-    result = '\n'.join(texts).strip()
+    # Chat Completions response: choices[0].message.content
+    result = data.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
     if not result:
         print(
             f'Error: GPT returned an empty response.\nFull API response:\n{json.dumps(data, indent=2)}',
