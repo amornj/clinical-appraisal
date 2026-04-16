@@ -1,370 +1,490 @@
 #!/usr/bin/env python3
+"""clinical-appraisal — AI-assisted critical appraisal of clinical study PDFs.
+
+Authentication: OAuth only, via ~/.codex/auth.json (tokens.access_token).
+Model: gpt-5.4 via OpenAI Responses API.
+Framework: Al-Jundi & Sakka, JCDR 2017 — 10 standard questions + CONSORT/PRISMA.
+Output: PDF → --outdir (default ./output), Markdown → Obsidian Journal.
+"""
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
-import textwrap
 import urllib.request
+import urllib.error
 from pathlib import Path
 from datetime import datetime
 
-DEFAULT_FRAMEWORK = Path('/Users/home/.openclaw/media/inbound/jcdr-11-JE01---5f8db21a-9210-4656-8682-17074fb9e54d.pdf')
-DEFAULT_RENDERER = Path('/Users/home/.openclaw/workspace/md_to_presentation_pdf.py')
-DEFAULT_EMAIL = 'amornj@library.readwise.io'
-DEFAULT_MODEL = 'gpt-5.4'
+# ── defaults ──────────────────────────────────────────────────────────────────
+DEFAULT_EMAIL      = 'amornj@library.readwise.io'
+DEFAULT_MODEL      = 'gpt-5.4'
 DEFAULT_CODEX_AUTH = Path.home() / '.codex' / 'auth.json'
+DEFAULT_OUTDIR     = Path('output')
+OBSIDIAN_JOURNAL   = Path('/Users/home/projects/obsidian/Journal')
+
+# ── colours for the clinical PDF (fpdf2) ──────────────────────────────────────
+C_PAGE_BG    = (255, 255, 255)
+C_HEADER_BG  = (20,  60, 120)
+C_HEADER_FG  = (255, 255, 255)
+C_SECTION_BG = (235, 241, 250)
+C_SECTION_FG = (20,  60, 120)
+C_BODY_FG    = (30,  30,  30)
+C_ACCENT     = (180,  20,  20)
+C_RULE       = (180, 195, 215)
 
 
-def run(cmd):
-    return subprocess.check_output(cmd, text=True)
-
+# ── utilities ─────────────────────────────────────────────────────────────────
 
 def pdf_text(path: Path) -> str:
-    return run(['pdftotext', str(path), '-'])
+    try:
+        return subprocess.check_output(['pdftotext', str(path), '-'], text=True)
+    except subprocess.CalledProcessError as e:
+        print(f'Error: pdftotext failed for "{path}" (exit {e.returncode}).\n'
+              'Make sure pdftotext is installed: brew install poppler', file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError:
+        print('Error: pdftotext not found. Install with: brew install poppler', file=sys.stderr)
+        sys.exit(1)
 
 
-def first_match(pattern, text, flags=0, default=''):
-    m = re.search(pattern, text, flags)
-    return m.group(1).strip() if m else default
+def sanitise_path(raw: str) -> Path:
+    """Strip shell backslash-escapes left inside double-quoted arguments."""
+    return Path(raw.replace('\\ ', ' ').replace('\\', ''))
 
 
-def clean_line(line: str) -> str:
-    return re.sub(r'\s+', ' ', line).strip(' -:\t')
+# ── OAuth authentication ───────────────────────────────────────────────────────
 
-
-def infer_title(text: str, fallback: str) -> str:
-    lines = [clean_line(x) for x in text.splitlines()]
-    lines = [x for x in lines if x and len(x) < 180]
-    bad = {'abstract', 'background', 'methods', 'results', 'conclusions', 'introduction'}
-    for i, line in enumerate(lines[:40]):
-        low = line.lower()
-        if low in bad:
-            continue
-        if 8 < len(line) < 140 and not re.match(r'^(doi|vol\.|journal|review article)', low):
-            if i + 1 < len(lines) and lines[i + 1].lower() not in bad and len(lines[i + 1]) < 120:
-                candidate = f"{line} {lines[i+1]}"
-                if len(candidate) < 160:
-                    return candidate
-            return line
-    return fallback
-
-
-def infer_doi(text: str) -> str:
-    m = re.search(r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', text, re.I)
-    return m.group(1) if m else 'DOI not found'
-
-
-def infer_journal_year(text: str) -> tuple[str, str]:
-    journal = first_match(r'^(.*?)\n', text, re.M, 'Unknown journal')
-    year = first_match(r'\b(19|20)\d{2}\b', text, 0, '')
-    return clean_line(journal), year
-
-
-def section(text: str, start: str, end_options: list[str]) -> str:
-    idx = text.lower().find(start.lower())
-    if idx == -1:
-        return ''
-    tail = text[idx + len(start):]
-    end_positions = [tail.lower().find(opt.lower()) for opt in end_options if tail.lower().find(opt.lower()) != -1]
-    end = min(end_positions) if end_positions else len(tail)
-    return tail[:end].strip()
-
-
-def extract_bullets(blob: str, limit: int = 6) -> list[str]:
-    items = []
-    for raw in blob.splitlines():
-        line = clean_line(raw)
-        if len(line) < 25:
-            continue
-        if re.match(r'^(background|methods|results|conclusions?|introduction)$', line.lower()):
-            continue
-        items.append(line)
-    uniq = []
-    for item in items:
-        if item not in uniq:
-            uniq.append(item)
-    return uniq[:limit]
-
-
-def framework_points(framework_text: str) -> dict:
-    return {
-        'standard_questions': [
-            'What is the research question?',
-            'What is the study type (design)?',
-            'Selection issues.',
-            'What are the outcome factors and how are they measured?',
-            'What are the study factors and how are they measured?',
-            'What important potential confounders are considered?',
-            'What is the statistical method used in the study?',
-            'Statistical results.',
-            'What conclusions did the authors reach?',
-            'Are ethical issues considered?'
-        ],
-        'rct_focus': [
-            'Allocation and randomization',
-            'Blinding',
-            'Follow-up and intention-to-treat',
-            'Data collection and bias control',
-            'Power calculation',
-            'Presentation clarity',
-            'Applicability to local population'
-        ],
-        'sr_focus': [
-            'Search strategy breadth',
-            'Quality control of included studies',
-            'Homogeneity',
-            'Precision of presentation',
-            'Applicability'
-        ]
-    }
-
-
-def load_oauth_access_token() -> str | None:
+def load_oauth_token() -> str:
+    """Return the OAuth access token from ~/.codex/auth.json or exit with a clear message."""
+    if not DEFAULT_CODEX_AUTH.exists():
+        print(
+            f'Error: OAuth token file not found at {DEFAULT_CODEX_AUTH}\n'
+            'Please authenticate first (e.g. run the Codex CLI login flow).',
+            file=sys.stderr
+        )
+        sys.exit(1)
     try:
         data = json.loads(DEFAULT_CODEX_AUTH.read_text())
-        return data.get('tokens', {}).get('access_token')
-    except Exception:
-        return None
+        token = data.get('tokens', {}).get('access_token', '').strip()
+    except Exception as exc:
+        print(f'Error: Could not read {DEFAULT_CODEX_AUTH}: {exc}', file=sys.stderr)
+        sys.exit(1)
+    if not token:
+        print(
+            f'Error: No access_token found in {DEFAULT_CODEX_AUTH}.\n'
+            'The file exists but tokens.access_token is empty or missing.\n'
+            'Please re-authenticate.',
+            file=sys.stderr
+        )
+        sys.exit(1)
+    return token
 
 
-def appraise_with_gpt(study_text: str, framework_text: str, pdf_name: str, model: str) -> str | None:
-    api_key = os.getenv('OPENAI_API_KEY')
-    oauth_token = load_oauth_access_token() if not api_key else None
-    if not api_key and not oauth_token:
-        return None
+# ── GPT-5.4 appraisal ─────────────────────────────────────────────────────────
 
-    prompt = f'''You are a clinician-statistician producing a structured critical appraisal in markdown.
-Use the supplied framework as the appraisal skeleton.
-Be concise, skeptical, clinically useful, and specific.
-Do not invent numerical results that are not present in the paper.
-At the end, include a section titled "# Presentation Slides" with 8 to 12 slide sections in markdown using headings like "## Slide 1: Title" and bullet points under each.
+SYSTEM_PROMPT = """You are a senior clinician-statistician producing a structured critical appraisal \
+of a clinical research article. Follow the Al-Jundi & Sakka (JCDR 2017) framework exactly.
 
-Framework text:
-{framework_text[:18000]}
+Rules:
+- Be concise, skeptical, and clinically useful.
+- Do NOT invent numbers, results, or citations not present in the paper.
+- If a section is absent from the paper, say so explicitly — do not omit the heading.
+- Use plain markdown (headers, bullet lists, bold for key terms). No tables.
+- Output the appraisal in the exact section order listed below.
+"""
 
-Study PDF filename: {pdf_name}
-Study text:
-{study_text[:70000]}
-'''
+APPRAISAL_TEMPLATE = """Produce a complete critical appraisal of the study below using this exact structure:
+
+# Critical Appraisal: [full paper title]
+
+## Paper Overview
+- **Journal:**
+- **Year:**
+- **DOI:**
+- **Authors & Institutions:**
+- **Funding / Conflicts of Interest:**
+
+## PICO
+- **P — Patient / Problem / Population:**
+- **I — Intervention:**
+- **C — Comparison:**
+- **O — Outcome(s):**
+
+## Study Type Classification
+- **Clinical question category:** (one of: Therapy | Aetiology/Causation | Prognosis | Diagnosis | Cost-effectiveness)
+- **Specific study design:** (e.g., RCT, cohort, case-control, cross-sectional, SR/meta-analysis, economic analysis)
+- **Appropriateness of design for the question:**
+
+## Abstract Appraisal
+- **Aim clearly stated:**
+- **Methods summary (design, groups, sample size, randomisation, measurement tools):**
+- **Results summary (key variables, statistics, significance):**
+- **Conclusion answers the question:**
+
+## Introduction / Background
+- **Rationale and gap addressed:**
+- **Prior work referenced appropriately:**
+- **Study purpose identified prospectively or post-hoc:**
+
+---
+
+## 10 Standard Questions (Al-Jundi & Sakka)
+
+### Q1 — What is the research question?
+Answer using PICO. Is the question clinically significant and clearly focused?
+
+### Q2 — What is the study type (design)?
+Is the design appropriate for the clinical question? Is randomisation described (type, stratification)?
+Is there a control group? Are samples similar at baseline?
+
+### Q3 — Selection issues
+- How were subjects recruited? Is the sample representative?
+- Eligibility criteria stated with reasons?
+- Sample size justified (power calculation)?
+- Blinding: who was blinded (participants, assessors, analysts)?
+- Dropout rate and attrition handling?
+- Potential selection biases (prevalence bias, admission-rate bias, volunteer bias, recall bias, lead-time bias, detection bias)?
+
+### Q4 — Outcome factors and measurement
+- All relevant outcomes assessed?
+- Measurement tools valid and reliable?
+- Intra/inter-examiner reliability reported?
+- Measurement error an important source of bias?
+
+### Q5 — Study factors and measurement
+- All relevant study factors included?
+- Factors measured with appropriate, validated tools?
+
+### Q6 — Confounders
+- Potential confounders identified and controlled?
+- Methods used: matching, restriction, randomisation, blinding, regression adjustment?
+- Is confounding an important residual concern?
+
+### Q7 — Statistical methods
+- Tests appropriate for the data type and distribution?
+- Methods described in sufficient detail to reproduce?
+- Confidence intervals and p-values reported?
+- Absolute risk reduction reported alongside relative risk reduction?
+
+### Q8 — Statistical results
+- Do results directly answer the research question?
+- p-value interpretation: statistical vs clinical significance distinguished?
+- Confidence interval width — is precision adequate?
+- Adverse events reported?
+- Subgroup analyses: pre-specified or exploratory?
+
+### Q9 — Conclusions
+- Conclusions justified by the data?
+- Authors avoid extrapolating beyond the data?
+- Limitations acknowledged, with effects on outcomes discussed?
+- Suggestions for future research?
+- Bibliography follows a standard format?
+
+### Q10 — Ethics
+- Ethics approval / IRB stated?
+- Identifiable ethical issues?
+- Conflicts of interest declared?
+
+---
+
+## Study-Type Checklist
+
+[Apply CONSORT if RCT; PRISMA if SR/meta-analysis; Observational checklist otherwise.]
+
+**For RCT (CONSORT):**
+- Allocation (randomisation method, stratification, concealment):
+- Blinding (participants, providers, assessors):
+- Follow-up and intention-to-treat analysis:
+- Data collection and bias control:
+- Power calculation and sample size:
+- Results clarity and precision:
+- Applicability to local / target population:
+
+**For SR / Meta-analysis (PRISMA):**
+- Search strategy (published + unpublished + non-English + expert contact):
+- Quality control of included studies (scoring system, ≥2 reviewers):
+- Homogeneity of included studies:
+- Precision and clarity of results:
+- Applicability to local population:
+
+**For Observational / Other:**
+- Sample selection method and representativeness:
+- Control of confounding:
+- Measurement validity and reliability:
+- Follow-up completeness:
+- Generalisability (external validity):
+
+---
+
+## Statistical Appraisal
+- Primary result(s) with exact values (mean ± SD, HR, OR, RR, MD, NNT — whatever is reported):
+- p-value(s) and interpretation:
+- Confidence interval(s) and clinical meaning:
+- Clinical significance vs statistical significance:
+- Effect size — is it clinically meaningful?
+
+## Limitations
+List the study's own stated limitations and any additional ones identified.
+
+## Bottom Line / Clinical Verdict
+A 3–5 sentence synthesis: what this study adds, its key methodological strengths and weaknesses,
+and whether the findings are trustworthy enough to influence clinical practice.
+
+---
+*Appraisal generated {date} using GPT-5.4 | Framework: Al-Jundi & Sakka, JCDR 2017*
+
+---
+
+Study text follows:
+
+{study_text}
+"""
+
+
+def appraise_with_gpt(study_text: str, pdf_name: str, model: str) -> str:
+    token = load_oauth_token()
+    date  = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    prompt = APPRAISAL_TEMPLATE.format(
+        date=date,
+        study_text=study_text[:72000]
+    )
 
     payload = {
         'model': model,
-        'input': prompt
+        'instructions': SYSTEM_PROMPT,
+        'input': prompt,
     }
-    bearer = api_key or oauth_token
+
     req = urllib.request.Request(
         'https://api.openai.com/v1/responses',
         data=json.dumps(payload).encode('utf-8'),
         headers={
-            'Authorization': f'Bearer {bearer}',
-            'Content-Type': 'application/json'
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
         },
-        method='POST'
+        method='POST',
     )
+
+    print(f'Sending to {model}…', flush=True)
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with urllib.request.urlopen(req, timeout=240) as resp:
             data = json.loads(resp.read().decode('utf-8'))
-        if 'output_text' in data and data['output_text']:
-            return data['output_text']
-        texts = []
-        for item in data.get('output', []):
-            for content in item.get('content', []):
-                if content.get('type') in ('output_text', 'text'):
-                    texts.append(content.get('text', ''))
-        return '\n'.join(texts).strip() or None
-    except Exception:
-        return None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        print(
+            f'Error: OpenAI API returned HTTP {e.code}.\n'
+            f'Response: {body}\n'
+            'Check that your OAuth token is valid and not expired.',
+            file=sys.stderr
+        )
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f'Error: Network error calling OpenAI API: {e.reason}', file=sys.stderr)
+        sys.exit(1)
+
+    # Parse response — support both output_text shorthand and output[].content[] format
+    if data.get('output_text'):
+        return data['output_text']
+    texts = []
+    for item in data.get('output', []):
+        for content in item.get('content', []):
+            if content.get('type') in ('output_text', 'text'):
+                texts.append(content.get('text', ''))
+    result = '\n'.join(texts).strip()
+    if not result:
+        print(
+            f'Error: GPT returned an empty response.\nFull API response:\n{json.dumps(data, indent=2)}',
+            file=sys.stderr
+        )
+        sys.exit(1)
+    return result
 
 
-def appraise(study_text: str, framework_text: str, pdf_name: str) -> str:
-    title = infer_title(study_text, Path(pdf_name).stem)
-    doi = infer_doi(study_text)
-    journal, year = infer_journal_year(study_text)
-    abstract = section(study_text, 'Abstract', ['Introduction', 'Background', 'Methods']) or section(study_text, 'BACKGROUND', ['METHODS'])
-    methods = section(study_text, 'Methods', ['Results', 'RESULTS', 'Discussion', 'DISCUSSION'])
-    results = section(study_text, 'Results', ['Discussion', 'DISCUSSION', 'Conclusions', 'CONCLUSIONS'])
-    discussion = section(study_text, 'Discussion', ['Conclusion', 'CONCLUSION', 'References'])
+# ── PDF rendering (fpdf2, clinical document style) ────────────────────────────
 
-    abs_bullets = extract_bullets(abstract, 5)
-    methods_bullets = extract_bullets(methods, 6)
-    results_bullets = extract_bullets(results, 6)
-    discussion_bullets = extract_bullets(discussion, 4)
-    fw = framework_points(framework_text)
+def render_clinical_pdf(markdown: str, pdf_path: Path) -> None:
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        print('Error: fpdf2 not installed. Run: pip3 install fpdf2', file=sys.stderr)
+        sys.exit(1)
 
-    study_type = 'Randomized trial' if re.search(r'\brandomi[sz]ed\b|placebo|double-blind|trial', study_text, re.I) else 'Systematic review / meta-analysis' if re.search(r'systematic review|meta-analysis|prisma', study_text, re.I) else 'Observational / other study'
+    class ClinicalPDF(FPDF):
+        def header(self):
+            pass
 
-    weak_points = []
-    if not re.search(r'blinded|double-blind|single-blind', study_text, re.I):
-        weak_points.append('Blinding is not clearly described in the extracted text, so measurement and treatment-behavior bias need checking.')
-    if not re.search(r'intention to treat|intention-to-treat', study_text, re.I):
-        weak_points.append('Intention-to-treat handling is not obvious from the extracted text and should be verified.')
-    if not re.search(r'sample size|power', study_text, re.I):
-        weak_points.append('Power calculation / sample-size justification is not clearly visible, which weakens confidence in negative or borderline findings.')
-    if not re.search(r'confound', study_text, re.I) and study_type != 'Randomized trial':
-        weak_points.append('Potential confounders are not explicitly discussed in the extracted text.')
-    if not re.search(r'ethic|institutional review|IRB', study_text, re.I):
-        weak_points.append('Ethics approval is not obvious in the extracted text and should be confirmed.')
-    if not weak_points:
-        weak_points.append('No single fatal flaw is obvious from text extraction alone, but protocol details should still be checked against the full paper.')
+        def footer(self):
+            self.set_y(-12)
+            self.set_font('Helvetica', 'I', 8)
+            self.set_text_color(*C_RULE)
+            self.cell(0, 8, f'Page {self.page_no()}', align='C')
 
-    strange_points = []
-    if study_type == 'Randomized trial' and not re.search(r'control|placebo|comparator', study_text, re.I):
-        strange_points.append('Comparator strategy is not clearly visible in the extracted text, which is a basic credibility check.')
-    if re.search(r'composite', study_text, re.I):
-        strange_points.append('Composite outcomes need inspection for whether the result is driven by the softest component.')
-    if re.search(r'surrogate|biomarker', study_text, re.I):
-        strange_points.append('Surrogate-heavy reasoning may overstate bedside value if hard clinical outcomes are limited.')
-    if not strange_points:
-        strange_points.append('The main thing to watch is whether reported strengths are methodological or mostly reporting quality.')
+    pdf = ClinicalPDF(orientation='P', unit='mm', format='A4')
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(18, 18, 18)
+    pdf.add_page()
 
-    clinical_take = []
-    if study_type == 'Randomized trial':
-        clinical_take.append('Use CONSORT-style checks before trusting a strong claim.')
-        clinical_take.append('Prioritize randomization, blinding, attrition, endpoint construction, and whether effect size is clinically meaningful.')
-    elif 'Systematic review' in study_type:
-        clinical_take.append('Use PRISMA-style checks, especially search completeness and quality of included studies.')
-        clinical_take.append('A meta-analysis is only as good as the underlying studies and heterogeneity handling.')
-    else:
-        clinical_take.append('Prioritize selection bias, confounding, follow-up quality, and overclaiming causality.')
-        clinical_take.append('Observational effect sizes should be interpreted more cautiously than randomized estimates.')
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
 
-    today = datetime.now().strftime('%Y-%m-%d %H:%M')
-    md = f'''# Clinical Appraisal: {title}
+    def rule():
+        pdf.set_draw_color(*C_RULE)
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + usable_w, pdf.get_y())
+        pdf.ln(2)
 
-## Citation
-- **Journal:** {journal}
-- **Year:** {year or 'Unknown'}
-- **DOI:** {doi}
-- **Generated:** {today}
+    def h1(text: str):
+        # Strip leading '#' characters
+        text = re.sub(r'^#+\s*', '', text)
+        pdf.set_fill_color(*C_HEADER_BG)
+        pdf.set_text_color(*C_HEADER_FG)
+        pdf.set_font('Helvetica', 'B', 13)
+        pdf.cell(usable_w, 9, text, fill=True, ln=True)
+        pdf.ln(2)
+        pdf.set_text_color(*C_BODY_FG)
 
-## Framework Used
-This appraisal follows the framework from **Critical Appraisal of Clinical Research** (Al-Jundi and Sakka, JCDR 2017), centered on:
-- research question
-- study design
-- selection issues
-- outcome and study factors
-- confounders
-- statistical methods and results
-- conclusions
-- ethics
+    def h2(text: str):
+        text = re.sub(r'^#+\s*', '', text)
+        pdf.set_fill_color(*C_SECTION_BG)
+        pdf.set_text_color(*C_SECTION_FG)
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.cell(usable_w, 7, text, fill=True, ln=True)
+        pdf.ln(1)
+        pdf.set_text_color(*C_BODY_FG)
 
-## Rapid Study Identification
-- **Inferred study type:** {study_type}
-- **Main title extracted:** {title}
+    def h3(text: str):
+        text = re.sub(r'^#+\s*', '', text)
+        pdf.set_text_color(*C_ACCENT)
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.multi_cell(usable_w, 6, text)
+        pdf.set_text_color(*C_BODY_FG)
+        pdf.ln(0.5)
 
-## What the paper appears to be asking
-'''
-    for bullet in abs_bullets[:3] or ['Extracted abstract text was limited, so the exact research question should be confirmed manually.']:
-        md += f'- {bullet}\n'
+    def body(text: str):
+        pdf.set_font('Helvetica', '', 9.5)
+        pdf.set_text_color(*C_BODY_FG)
+        pdf.multi_cell(usable_w, 5.5, text)
 
-    md += '\n## Methods Snapshot\n'
-    for bullet in methods_bullets[:6] or ['Methods section was not cleanly extracted.']:
-        md += f'- {bullet}\n'
+    def bullet(text: str):
+        pdf.set_font('Helvetica', '', 9.5)
+        pdf.set_text_color(*C_BODY_FG)
+        # Bold **key:** pattern
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+        pdf.set_x(pdf.l_margin + 4)
+        pdf.cell(4, 5.5, '\u2022', ln=False)
+        pdf.multi_cell(usable_w - 8, 5.5, text.strip())
 
-    md += '\n## Results Snapshot\n'
-    for bullet in results_bullets[:6] or ['Results section was not cleanly extracted.']:
-        md += f'- {bullet}\n'
+    def italic_footer(text: str):
+        text = re.sub(r'\*(.+?)\*', r'\1', text)
+        pdf.set_font('Helvetica', 'I', 8)
+        pdf.set_text_color(120, 120, 120)
+        pdf.multi_cell(usable_w, 5, text)
+        pdf.set_text_color(*C_BODY_FG)
 
-    md += '\n## Strange or Weak Methodologic Points\n'
-    for bullet in strange_points + weak_points:
-        md += f'- {bullet}\n'
+    lines = markdown.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
 
-    md += '\n## Checklist-Driven Questions to Verify\n'
-    for q in fw['standard_questions']:
-        md += f'- {q}\n'
+        if not stripped:
+            pdf.ln(2)
+        elif stripped.startswith('# '):
+            h1(stripped)
+        elif stripped.startswith('## '):
+            h2(stripped)
+        elif stripped.startswith('### '):
+            h3(stripped)
+        elif stripped == '---':
+            pdf.ln(1)
+            rule()
+        elif stripped.startswith('- ') or stripped.startswith('* '):
+            bullet(stripped[2:])
+        elif stripped.startswith('*') and stripped.endswith('*') and stripped.count('*') >= 2:
+            italic_footer(stripped)
+        else:
+            # Inline bold/italic cleanup for body text
+            stripped = re.sub(r'\*\*(.+?)\*\*', r'\1', stripped)
+            stripped = re.sub(r'\*(.+?)\*', r'\1', stripped)
+            body(stripped)
 
-    md += '\n## Clinical Appraisal Lens\n'
-    focus = fw['rct_focus'] if study_type == 'Randomized trial' else fw['sr_focus'] if 'Systematic review' in study_type else [
-        'Selection bias', 'Confounding', 'Measurement validity', 'Follow-up completeness', 'Generalizability'
-    ]
-    for item in focus:
-        md += f'- {item}\n'
+        i += 1
 
-    md += '\n## Discussion / Interpretation\n'
-    for bullet in discussion_bullets[:4] or clinical_take:
-        md += f'- {bullet}\n'
-    for bullet in clinical_take:
-        if bullet not in discussion_bullets:
-            md += f'- {bullet}\n'
-
-    md += '\n## Bottom Line\n'
-    md += '- This output is a structured first-pass clinical appraisal built from PDF text extraction and the supplied framework.\n'
-    md += '- Trust it most as a checklist-driven critique scaffold, then confirm key claims against the full article and tables.\n'
-    md += '- If you want bedside-grade appraisal, review randomization, attrition, outcome definitions, absolute effect size, and external validity before acting on the study.\n'
-
-    md += '\n---\n\n# Presentation Slides\n\n'
-    slides = [
-        ('Title', [title, f'{journal} {year}'.strip(), doi]),
-        ('Framework', ['Research question', 'Study design', 'Selection issues', 'Outcomes and confounders', 'Statistics, conclusions, ethics']),
-        ('Rapid Identification', [f'Inferred study type: {study_type}', f'Journal: {journal}', f'DOI: {doi}']),
-        ('What the Paper Asks', abs_bullets[:5] or ['Confirm exact PICO manually from full text']),
-        ('Methods Snapshot', methods_bullets[:6] or ['Methods extraction limited']),
-        ('Results Snapshot', results_bullets[:6] or ['Results extraction limited']),
-        ('Strange / Weak Points', (strange_points + weak_points)[:6]),
-        ('Checklist Questions', fw['standard_questions'][:6]),
-        ('Clinical Appraisal Lens', focus[:6]),
-        ('Bottom Line', ['Use this as a first-pass critique scaffold', 'Verify trial mechanics in full text', 'Do not confuse statistical positivity with clinical importance'])
-    ]
-    for idx, (slide_title, bullets) in enumerate(slides, start=1):
-        md += f'## Slide {idx}: {slide_title}\n'
-        for b in bullets:
-            md += f'- {b}\n'
-        md += '\n'
-    return md
+    pdf.output(str(pdf_path))
 
 
-def render_pdf(md_path: Path, pdf_path: Path, renderer: Path):
-    subprocess.check_call([sys.executable, str(renderer), str(md_path), str(pdf_path)])
-
+# ── email via Apple Mail ───────────────────────────────────────────────────────
 
 def send_mail(pdf_path: Path, recipient: str):
-    script = f'''
-tell application "Mail"
+    abs_path = str(pdf_path.resolve())
+    script = f'''tell application "Mail"
     activate
-    set msg to make new outgoing message with properties {{subject:"Clinical appraisal PDF", content:"Attached clinical appraisal PDF."}}
+    set msg to make new outgoing message with properties {{subject:"Clinical Appraisal: {pdf_path.stem}", content:"Please find the clinical appraisal attached."}}
     tell msg
         make new to recipient at end of to recipients with properties {{address:"{recipient}"}}
+        make new attachment at end of attachments with properties {{file name:POSIX file "{abs_path}"}}
+        send
     end tell
-    make new attachment at end of msg with properties {{file name:POSIX file "{pdf_path}"}}
-    send msg
-end tell
-'''
-    subprocess.check_call(['osascript', '-e', script])
+end tell'''
+    try:
+        subprocess.check_call(['osascript', '-e', script])
+    except subprocess.CalledProcessError as e:
+        print(f'Warning: Email failed (osascript exit {e.returncode}). PDF is at {abs_path}', file=sys.stderr)
 
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Create a clinical-appraisal PDF from a study PDF and email it.')
-    parser.add_argument('pdf', type=Path, help='Input study PDF')
-    parser.add_argument('--framework', type=Path, default=DEFAULT_FRAMEWORK, help='Framework PDF for appraisal structure')
-    parser.add_argument('--email', default=DEFAULT_EMAIL, help='Recipient email address')
-    parser.add_argument('--outdir', type=Path, default=Path('output'), help='Output directory')
-    parser.add_argument('--model', default=DEFAULT_MODEL, help='AI model for appraisal, default: gpt-5.4')
-    parser.add_argument('--no-email', action='store_true', help='Skip email send')
+    parser = argparse.ArgumentParser(
+        description='Critical appraisal of a clinical study PDF using GPT-5.4 (OAuth).'
+    )
+    parser.add_argument('pdf',        type=Path,        help='Input study PDF')
+    parser.add_argument('--email',    default=DEFAULT_EMAIL,  help='Recipient email (default: Readwise Reader)')
+    parser.add_argument('--outdir',   type=Path, default=DEFAULT_OUTDIR, help='PDF output directory (default: ./output)')
+    parser.add_argument('--model',    default=DEFAULT_MODEL,  help='Model (default: gpt-5.4)')
+    parser.add_argument('--no-email', action='store_true',    help='Skip email delivery')
     args = parser.parse_args()
 
+    # Normalise path (strip shell backslash-escapes inside double-quoted args)
+    args.pdf = sanitise_path(str(args.pdf))
+    if not args.pdf.exists():
+        print(f'Error: PDF not found: {args.pdf}', file=sys.stderr)
+        sys.exit(1)
+
+    # Output paths
     args.outdir.mkdir(parents=True, exist_ok=True)
-    study_text = pdf_text(args.pdf)
-    framework_text = pdf_text(args.framework)
+    OBSIDIAN_JOURNAL.mkdir(parents=True, exist_ok=True)
 
+    today_prefix = datetime.now().strftime('%Y-%m-%d')
     stem = re.sub(r'[^a-z0-9]+', '-', args.pdf.stem.lower()).strip('-') or 'clinical-appraisal'
-    md_path = args.outdir / f'{stem}-clinical-appraisal.md'
-    pdf_path = args.outdir / f'{stem}-clinical-appraisal.pdf'
+    md_path  = OBSIDIAN_JOURNAL / f'{today_prefix}-{stem}-appraisal.md'
+    pdf_path = args.outdir / f'{today_prefix}-{stem}-appraisal.pdf'
 
-    markdown = appraise_with_gpt(study_text, framework_text, args.pdf.name, args.model)
-    if not markdown:
-        markdown = appraise(study_text, framework_text, args.pdf.name)
-    md_path.write_text(markdown)
-    render_pdf(md_path, pdf_path, DEFAULT_RENDERER)
+    # Extract text
+    print(f'Extracting text from {args.pdf.name}…', flush=True)
+    study_text = pdf_text(args.pdf)
+    if len(study_text.strip()) < 200:
+        print('Warning: Very little text extracted. The PDF may be scanned/image-only.', file=sys.stderr)
+
+    # Appraise
+    markdown = appraise_with_gpt(study_text, args.pdf.name, args.model)
+
+    # Save markdown to Obsidian Journal
+    md_path.write_text(markdown, encoding='utf-8')
+    print(f'Markdown saved: {md_path}')
+
+    # Render clinical PDF
+    print('Rendering PDF…', flush=True)
+    render_clinical_pdf(markdown, pdf_path)
+    print(f'PDF saved:      {pdf_path}')
+
+    # Email
     if not args.no_email:
+        print(f'Sending to {args.email}…', flush=True)
         send_mail(pdf_path, args.email)
+        print(f'Emailed to:     {args.email}')
 
-    print(f'Model: {args.model}')
-    print(f'Markdown: {md_path}')
-    print(f'PDF: {pdf_path}')
-    if not args.no_email:
-        print(f'Emailed to: {args.email}')
+    print(f'\nDone. Model: {args.model}')
 
 
 if __name__ == '__main__':

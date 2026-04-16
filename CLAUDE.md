@@ -2,84 +2,101 @@
 
 ## Project overview
 
-A CLI tool that converts a clinical-study PDF into a structured critical-appraisal document (markdown + presentation PDF) and emails it to a configured recipient.
+Single-file Python 3 CLI that converts a clinical-study PDF into a structured critical-appraisal
+document and emails it to Readwise Reader. No external packages beyond stdlib + `fpdf2`.
 
-## Key entry point
+## Entry point
 
-`clinical_appraisal.py` — single-file Python 3 CLI. No external packages beyond stdlib.
+`clinical_appraisal.py` — all logic lives here.
 
 ## Default model
 
 **GPT-5.4** via the OpenAI Responses API (`https://api.openai.com/v1/responses`).
 
-## Authentication strategy (OAuth-first)
+## Authentication — OAuth only
 
-The tool resolves a bearer token in this priority order:
+The tool reads an OAuth access token from `~/.codex/auth.json` at key path `tokens.access_token`.
+There is no `OPENAI_API_KEY` fallback. If the token is missing, empty, or the API returns an HTTP
+error, the tool prints a clear human-readable message and exits non-zero. No silent fallbacks.
 
-1. `OPENAI_API_KEY` environment variable (standard API key).
-2. **OAuth access token** read from `~/.codex/auth.json` at key path `tokens.access_token` — this is the primary method for this project.
+Relevant function: `load_oauth_token()`.
 
-The loader is `load_oauth_access_token()` at line 124. The token is passed as a standard `Authorization: Bearer` header to the Responses API, so OAuth and API-key paths are interchangeable at the HTTP level.
+## Output routing
 
-## Important file paths (user-specific, do not change without checking)
-
-| Constant | Purpose |
+| Artefact | Destination |
 |---|---|
-| `DEFAULT_FRAMEWORK` | Framework PDF (`~/.openclaw/media/inbound/jcdr-*.pdf`) |
-| `DEFAULT_RENDERER` | Markdown → PDF script (`~/.openclaw/workspace/md_to_presentation_pdf.py`) |
-| `DEFAULT_EMAIL` | Readwise Reader email (`amornj@library.readwise.io`) |
-| `DEFAULT_CODEX_AUTH` | OAuth token file (`~/.codex/auth.json`) |
+| Markdown | `/Users/home/projects/obsidian/Journal/<date>-<stem>-appraisal.md` |
+| PDF | `./output/<date>-<stem>-appraisal.pdf` (or `--outdir`) |
 
-## Appraisal pipeline
+The PDF is rendered directly from markdown using `fpdf2` (no external renderer, no LaTeX).
+No markdown is written to the output folder.
 
-```
-Input PDF
-  ↓ pdftotext
-study_text
-  ↓ appraise_with_gpt()   ← tries GPT-5.4 first
-  │     (falls back to)
-  └─ appraise()            ← heuristic regex-based fallback
-  ↓
-Markdown file  (output/<stem>-clinical-appraisal.md)
-  ↓ md_to_presentation_pdf.py
-PDF file       (output/<stem>-clinical-appraisal.pdf)
-  ↓ osascript / Apple Mail
-Email to recipient
-```
+## Appraisal framework — Al-Jundi & Sakka (JCDR 2017)
 
-## Framework used for critical appraisal
+Three layers, all enforced in the GPT-5.4 prompt:
 
-Based on **Al-Jundi & Sakka, JCDR 2017** — 10 standard questions covering: research question, study design, selection, outcomes, confounders, statistical method, results, conclusions, ethics. Extra checklists for RCTs (CONSORT-style) and systematic reviews (PRISMA-style).
+1. **Paper overview** — journal, title, authors, institution, funding/COI
+2. **PICO** — P, I, C, O parsed explicitly
+3. **Study type classification** — one of 5 clinical question categories + specific design
+4. **10 standard questions** — each answered with sub-checklist items from the article
+5. **Study-type checklist** — CONSORT (RCT), PRISMA (SR/meta-analysis), or Observational
+6. **Statistical appraisal** — p-values, CIs, absolute vs relative risk, clinical significance
+7. **Ethics** — IRB, COI, funding
+8. **Limitations & future research**
+9. **Bottom line / clinical verdict**
+
+The prompt is in `SYSTEM_PROMPT` + `APPRAISAL_TEMPLATE` constants — edit those to change the
+output structure.
+
+## PDF renderer
+
+`render_clinical_pdf(markdown, pdf_path)` uses `fpdf2` to produce a white-background clinical
+document (not a dark-slide presentation):
+- Navy header bar for `#` headings
+- Light-blue fill for `##` section headings
+- Red-accent `###` sub-headings
+- Bullet list support, horizontal rules, italic footer line
 
 ## Running the tool
 
 ```bash
-# Minimal — uses all defaults
-python3 clinical_appraisal.py /path/to/study.pdf
+# Standard usage
+clinical-appraisal /path/to/study.pdf
 
-# Full options
-python3 clinical_appraisal.py /path/to/study.pdf \
-  --framework /path/to/framework.pdf \
+# Skip email (development)
+clinical-appraisal /path/to/study.pdf --no-email
+
+# All options
+clinical-appraisal /path/to/study.pdf \
   --email you@example.com \
-  --model gpt-5.4 \
   --outdir ./output \
+  --model gpt-5.4 \
   --no-email
 ```
 
-## Development notes
+## Error handling
 
-- Python 3.10+ required (uses `str | None` union syntax).
-- `pdftotext` (poppler-utils) must be on `PATH`.
-- Apple Mail must be configured on the host machine for email delivery.
-- The tool is intentionally dependency-free (no `pip install` needed).
-- Do **not** add speculative features or extra abstraction layers — the single-file design is intentional.
+| Condition | Behaviour |
+|---|---|
+| `~/.codex/auth.json` missing | Clear message + exit 1 |
+| `access_token` empty/missing | Clear message + exit 1 |
+| API HTTP error (401, 429, 5xx) | HTTP code + response body + exit 1 |
+| Network error | Reason + exit 1 |
+| Empty GPT response | Full response JSON + exit 1 |
+| `pdftotext` not found | Install hint + exit 1 |
+| `fpdf2` not installed | Install hint + exit 1 |
+| Input PDF not found | Path + exit 1 |
 
-## Testing
+## Dependencies
 
-There is no test suite. Manual testing: run against a real PDF and verify markdown output. Check `output/` for generated files.
+- Python 3.10+ (uses `str | None` union syntax)
+- `pdftotext` — `brew install poppler`
+- `fpdf2` — already installed (`fpdf2 2.8.6`)
+- macOS Mail — required for email delivery
 
-## Output
+## Design rules
 
-Files are written to `./output/` by default:
-- `<stem>-clinical-appraisal.md`
-- `<stem>-clinical-appraisal.pdf`
+- Single file, no `pip install` setup, no framework.
+- Do not add heuristic fallbacks — GPT-5.4 or exit.
+- Do not add slides/presentation output — it's a clinical document.
+- The Obsidian Journal path and Readwise email are intentional user preferences; do not parameterise them away.
