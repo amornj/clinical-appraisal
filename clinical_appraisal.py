@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
 """clinical-appraisal — AI-assisted critical appraisal of clinical study PDFs.
 
-Authentication: OAuth only, via ~/.codex/auth.json (tokens.access_token).
-Model: gpt-5.4 via OpenAI Responses API.
+Authentication: Delegates to `codex exec` which handles ChatGPT OAuth internally.
+Model: gpt-5.4 (default).
 Framework: Al-Jundi & Sakka, JCDR 2017 — 10 standard questions + CONSORT/PRISMA.
 Output: PDF → --outdir (default ./output), Markdown → Obsidian Journal.
 """
 import argparse
-import json
 import re
-import ssl
 import subprocess
 import sys
-import urllib.request
-import urllib.error
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_EMAIL      = 'amornj@library.readwise.io'
 DEFAULT_MODEL      = 'gpt-5.4'
-DEFAULT_CODEX_AUTH = Path.home() / '.codex' / 'auth.json'
 DEFAULT_OUTDIR     = Path('output')
 OBSIDIAN_JOURNAL   = Path('/Users/home/projects/obsidian/Journal')
 
 # ── colours for the clinical PDF (fpdf2) ──────────────────────────────────────
-C_PAGE_BG    = (255, 255, 255)
 C_HEADER_BG  = (20,  60, 120)
 C_HEADER_FG  = (255, 255, 255)
 C_SECTION_BG = (235, 241, 250)
@@ -54,61 +49,9 @@ def sanitise_path(raw: str) -> Path:
     return Path(raw.replace('\\ ', ' ').replace('\\', ''))
 
 
-# ── SSL context (macOS Python ships without CA bundle linked) ─────────────────
+# ── GPT-5.4 appraisal via codex exec ─────────────────────────────────────────
 
-def make_ssl_context() -> ssl.SSLContext:
-    """Return a verified SSL context, trying certifi then /etc/ssl/cert.pem (macOS)."""
-    try:
-        import certifi
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        return ctx
-    except ImportError:
-        pass
-    # macOS ships a CA bundle at /etc/ssl/cert.pem
-    import os
-    mac_bundle = '/etc/ssl/cert.pem'
-    if os.path.exists(mac_bundle):
-        ctx = ssl.create_default_context(cafile=mac_bundle)
-        return ctx
-    # Last resort: unverified (warns the user)
-    print('Warning: no CA bundle found; proceeding with unverified TLS.', file=sys.stderr)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-# ── OAuth authentication ───────────────────────────────────────────────────────
-
-def load_oauth_token() -> str:
-    """Return the OAuth access token from ~/.codex/auth.json or exit with a clear message."""
-    if not DEFAULT_CODEX_AUTH.exists():
-        print(
-            f'Error: OAuth token file not found at {DEFAULT_CODEX_AUTH}\n'
-            'Please authenticate first (e.g. run the Codex CLI login flow).',
-            file=sys.stderr
-        )
-        sys.exit(1)
-    try:
-        data = json.loads(DEFAULT_CODEX_AUTH.read_text())
-        token = data.get('tokens', {}).get('access_token', '').strip()
-    except Exception as exc:
-        print(f'Error: Could not read {DEFAULT_CODEX_AUTH}: {exc}', file=sys.stderr)
-        sys.exit(1)
-    if not token:
-        print(
-            f'Error: No access_token found in {DEFAULT_CODEX_AUTH}.\n'
-            'The file exists but tokens.access_token is empty or missing.\n'
-            'Please re-authenticate.',
-            file=sys.stderr
-        )
-        sys.exit(1)
-    return token
-
-
-# ── GPT-5.4 appraisal ─────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are a senior clinician-statistician producing a structured critical appraisal \
+APPRAISAL_PROMPT = """You are a senior clinician-statistician producing a structured critical appraisal
 of a clinical research article. Follow the Al-Jundi & Sakka (JCDR 2017) framework exactly.
 
 Rules:
@@ -116,10 +59,10 @@ Rules:
 - Do NOT invent numbers, results, or citations not present in the paper.
 - If a section is absent from the paper, say so explicitly — do not omit the heading.
 - Use plain markdown (headers, bullet lists, bold for key terms). No tables.
-- Output the appraisal in the exact section order listed below.
-"""
+- Output ONLY the appraisal markdown — no explanations, no preamble, no tool calls.
+- Do NOT read any files or run any commands. The study text is provided below.
 
-APPRAISAL_TEMPLATE = """Produce a complete critical appraisal of the study below using this exact structure:
+Produce a complete critical appraisal using this exact structure:
 
 # Critical Appraisal: [full paper title]
 
@@ -228,7 +171,7 @@ Is there a control group? Are samples similar at baseline?
 
 **For SR / Meta-analysis (PRISMA):**
 - Search strategy (published + unpublished + non-English + expert contact):
-- Quality control of included studies (scoring system, ≥2 reviewers):
+- Quality control of included studies (scoring system, >=2 reviewers):
 - Homogeneity of included studies:
 - Precision and clarity of results:
 - Applicability to local population:
@@ -243,7 +186,7 @@ Is there a control group? Are samples similar at baseline?
 ---
 
 ## Statistical Appraisal
-- Primary result(s) with exact values (mean ± SD, HR, OR, RR, MD, NNT — whatever is reported):
+- Primary result(s) with exact values (mean +/- SD, HR, OR, RR, MD, NNT — whatever is reported):
 - p-value(s) and interpretation:
 - Confidence interval(s) and clinical meaning:
 - Clinical significance vs statistical significance:
@@ -253,11 +196,11 @@ Is there a control group? Are samples similar at baseline?
 List the study's own stated limitations and any additional ones identified.
 
 ## Bottom Line / Clinical Verdict
-A 3–5 sentence synthesis: what this study adds, its key methodological strengths and weaknesses,
+A 3-5 sentence synthesis: what this study adds, its key methodological strengths and weaknesses,
 and whether the findings are trustworthy enough to influence clinical practice.
 
 ---
-*Appraisal generated {date} using GPT-5.4 | Framework: Al-Jundi & Sakka, JCDR 2017*
+*Appraisal generated {date} using {model} | Framework: Al-Jundi & Sakka, JCDR 2017*
 
 ---
 
@@ -267,64 +210,122 @@ Study text follows:
 """
 
 
-def appraise_with_gpt(study_text: str, pdf_name: str, model: str) -> str:
-    token = load_oauth_token()
-    date  = datetime.now().strftime('%Y-%m-%d %H:%M')
+def appraise_with_codex(study_text: str, pdf_name: str, model: str) -> str:
+    """Call GPT via `codex exec` which handles ChatGPT OAuth internally."""
 
-    prompt = APPRAISAL_TEMPLATE.format(
-        date=date,
-        study_text=study_text[:72000]
-    )
-
-    # Use Chat Completions API — the OAuth token issued by the Codex CLI has the
-    # api.chat.completions.write scope, not api.responses.write (Responses API).
-    payload = {
-        'model': model,
-        'messages': [
-            {'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user',   'content': prompt},
-        ],
-    }
-
-    req = urllib.request.Request(
-        'https://api.openai.com/v1/chat/completions',
-        data=json.dumps(payload).encode('utf-8'),
-        headers={
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
-
-    print(f'Sending to {model}…', flush=True)
+    # Check codex is available
     try:
-        with urllib.request.urlopen(req, timeout=300, context=make_ssl_context()) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8', errors='replace')
-        print(
-            f'Error: OpenAI API returned HTTP {e.code}.\n'
-            f'Response: {body}\n'
-            'Your OAuth token may be expired. Re-login with: codex auth login',
-            file=sys.stderr
-        )
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f'Error: Network error calling OpenAI API: {e.reason}', file=sys.stderr)
+        subprocess.check_output(['codex', '--version'], text=True, stderr=subprocess.STDOUT)
+    except FileNotFoundError:
+        print('Error: codex CLI not found on PATH.\n'
+              'Install: npm install -g @openai/codex', file=sys.stderr)
         sys.exit(1)
 
-    # Chat Completions response: choices[0].message.content
-    result = data.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
-    if not result:
-        print(
-            f'Error: GPT returned an empty response.\nFull API response:\n{json.dumps(data, indent=2)}',
-            file=sys.stderr
-        )
+    # Check login status
+    try:
+        status = subprocess.check_output(
+            ['codex', 'login', 'status'], text=True, stderr=subprocess.STDOUT
+        ).strip()
+    except subprocess.CalledProcessError:
+        status = ''
+    if 'Logged in' not in status:
+        print('Error: Not logged in to Codex.\n'
+              'Please run: codex login\n'
+              'Then try again.', file=sys.stderr)
         sys.exit(1)
-    return result
+
+    date = datetime.now().strftime('%Y-%m-%d %H:%M')
+    prompt = APPRAISAL_PROMPT.format(
+        date=date,
+        model=model,
+        study_text=study_text[:72000],
+    )
+
+    # Write prompt to temp file (avoids shell argument length limits)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(prompt)
+        prompt_path = Path(f.name)
+
+    # Write output to temp file
+    output_path = Path(tempfile.mktemp(suffix='.md'))
+
+    print(f'Sending to {model} via codex…', flush=True)
+    try:
+        result = subprocess.run(
+            [
+                'codex', 'exec',
+                '-m', model,
+                '--sandbox', 'read-only',
+                '--ephemeral',
+                '--skip-git-repo-check',
+                '-o', str(output_path),
+            ],
+            stdin=open(prompt_path),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        print('Error: codex exec timed out after 10 minutes.', file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f'Error: Failed to run codex exec: {e}', file=sys.stderr)
+        sys.exit(1)
+    finally:
+        prompt_path.unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        stderr_msg = result.stderr.strip()
+        # Check for common auth/rate-limit issues
+        if 'usage limit' in stderr_msg.lower() or 'expired' in stderr_msg.lower():
+            print(f'Error: Codex authentication or rate limit issue.\n{stderr_msg}\n'
+                  'Try: codex login', file=sys.stderr)
+        else:
+            print(f'Error: codex exec failed (exit {result.returncode}).\n{stderr_msg}', file=sys.stderr)
+        sys.exit(1)
+
+    # Read output
+    if output_path.exists():
+        markdown = output_path.read_text(encoding='utf-8').strip()
+        output_path.unlink(missing_ok=True)
+    else:
+        markdown = ''
+
+    if not markdown:
+        print('Error: codex exec produced no output.\n'
+              f'stdout: {result.stdout[:500]}\n'
+              f'stderr: {result.stderr[:500]}', file=sys.stderr)
+        sys.exit(1)
+
+    return markdown
 
 
 # ── PDF rendering (fpdf2, clinical document style) ────────────────────────────
+
+_UNICODE_MAP = str.maketrans({
+    '\u2014': '--',   # em dash
+    '\u2013': '-',    # en dash
+    '\u2018': "'",    # left single quote
+    '\u2019': "'",    # right single quote
+    '\u201c': '"',    # left double quote
+    '\u201d': '"',    # right double quote
+    '\u2022': '-',    # bullet
+    '\u2026': '...',  # ellipsis
+    '\u00b1': '+/-',  # plus-minus
+    '\u2264': '<=',   # less-than-or-equal
+    '\u2265': '>=',   # greater-than-or-equal
+    '\u00d7': 'x',    # multiplication sign
+    '\u2192': '->',   # right arrow
+    '\u00a0': ' ',    # non-breaking space
+})
+
+
+def _latin1_safe(text: str) -> str:
+    """Replace Unicode characters that Helvetica (latin-1) can't render."""
+    text = text.translate(_UNICODE_MAP)
+    # Drop anything still outside latin-1
+    return text.encode('latin-1', errors='replace').decode('latin-1')
+
 
 def render_clinical_pdf(markdown: str, pdf_path: Path) -> None:
     try:
@@ -356,26 +357,25 @@ def render_clinical_pdf(markdown: str, pdf_path: Path) -> None:
         pdf.ln(2)
 
     def h1(text: str):
-        # Strip leading '#' characters
-        text = re.sub(r'^#+\s*', '', text)
+        text = _latin1_safe(re.sub(r'^#+\s*', '', text))
         pdf.set_fill_color(*C_HEADER_BG)
         pdf.set_text_color(*C_HEADER_FG)
         pdf.set_font('Helvetica', 'B', 13)
-        pdf.cell(usable_w, 9, text, fill=True, ln=True)
+        pdf.cell(usable_w, 9, text, fill=True, new_x='LMARGIN', new_y='NEXT')
         pdf.ln(2)
         pdf.set_text_color(*C_BODY_FG)
 
     def h2(text: str):
-        text = re.sub(r'^#+\s*', '', text)
+        text = _latin1_safe(re.sub(r'^#+\s*', '', text))
         pdf.set_fill_color(*C_SECTION_BG)
         pdf.set_text_color(*C_SECTION_FG)
         pdf.set_font('Helvetica', 'B', 11)
-        pdf.cell(usable_w, 7, text, fill=True, ln=True)
+        pdf.cell(usable_w, 7, text, fill=True, new_x='LMARGIN', new_y='NEXT')
         pdf.ln(1)
         pdf.set_text_color(*C_BODY_FG)
 
     def h3(text: str):
-        text = re.sub(r'^#+\s*', '', text)
+        text = _latin1_safe(re.sub(r'^#+\s*', '', text))
         pdf.set_text_color(*C_ACCENT)
         pdf.set_font('Helvetica', 'B', 10)
         pdf.multi_cell(usable_w, 6, text)
@@ -385,28 +385,25 @@ def render_clinical_pdf(markdown: str, pdf_path: Path) -> None:
     def body(text: str):
         pdf.set_font('Helvetica', '', 9.5)
         pdf.set_text_color(*C_BODY_FG)
-        pdf.multi_cell(usable_w, 5.5, text)
+        pdf.multi_cell(usable_w, 5.5, _latin1_safe(text))
 
     def bullet(text: str):
         pdf.set_font('Helvetica', '', 9.5)
         pdf.set_text_color(*C_BODY_FG)
-        # Bold **key:** pattern
-        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+        text = _latin1_safe(re.sub(r'\*\*(.+?)\*\*', r'\1', text))
         pdf.set_x(pdf.l_margin + 4)
-        pdf.cell(4, 5.5, '\u2022', ln=False)
+        pdf.cell(4, 5.5, '-', new_x='RIGHT', new_y='TOP')
         pdf.multi_cell(usable_w - 8, 5.5, text.strip())
 
     def italic_footer(text: str):
-        text = re.sub(r'\*(.+?)\*', r'\1', text)
+        text = _latin1_safe(re.sub(r'\*(.+?)\*', r'\1', text))
         pdf.set_font('Helvetica', 'I', 8)
         pdf.set_text_color(120, 120, 120)
         pdf.multi_cell(usable_w, 5, text)
         pdf.set_text_color(*C_BODY_FG)
 
     lines = markdown.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
+    for line in lines:
         stripped = line.strip()
 
         if not stripped:
@@ -425,12 +422,9 @@ def render_clinical_pdf(markdown: str, pdf_path: Path) -> None:
         elif stripped.startswith('*') and stripped.endswith('*') and stripped.count('*') >= 2:
             italic_footer(stripped)
         else:
-            # Inline bold/italic cleanup for body text
             stripped = re.sub(r'\*\*(.+?)\*\*', r'\1', stripped)
             stripped = re.sub(r'\*(.+?)\*', r'\1', stripped)
             body(stripped)
-
-        i += 1
 
     pdf.output(str(pdf_path))
 
@@ -458,7 +452,7 @@ end tell'''
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Critical appraisal of a clinical study PDF using GPT-5.4 (OAuth).'
+        description='Critical appraisal of a clinical study PDF using GPT-5.4 via Codex OAuth.'
     )
     parser.add_argument('pdf',        type=Path,        help='Input study PDF')
     parser.add_argument('--email',    default=DEFAULT_EMAIL,  help='Recipient email (default: Readwise Reader)')
@@ -467,7 +461,7 @@ def main():
     parser.add_argument('--no-email', action='store_true',    help='Skip email delivery')
     args = parser.parse_args()
 
-    # Normalise path (strip shell backslash-escapes inside double-quoted args)
+    # Normalise path
     args.pdf = sanitise_path(str(args.pdf))
     if not args.pdf.exists():
         print(f'Error: PDF not found: {args.pdf}', file=sys.stderr)
@@ -488,8 +482,8 @@ def main():
     if len(study_text.strip()) < 200:
         print('Warning: Very little text extracted. The PDF may be scanned/image-only.', file=sys.stderr)
 
-    # Appraise
-    markdown = appraise_with_gpt(study_text, args.pdf.name, args.model)
+    # Appraise via codex
+    markdown = appraise_with_codex(study_text, args.pdf.name, args.model)
 
     # Save markdown to Obsidian Journal
     md_path.write_text(markdown, encoding='utf-8')
